@@ -7,8 +7,11 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/stretchr/testify/require"
+
 	"github.com/datazip-inc/olake/constants"
 	"github.com/datazip-inc/olake/types"
+	"github.com/datazip-inc/olake/utils/testutils/testhandler"
 	"github.com/datazip-inc/olake/utils/typeutils"
 )
 
@@ -409,6 +412,52 @@ func TestDataTypeConverter(t *testing.T) {
 			if !reflect.DeepEqual(got, tc.expected) {
 				t.Fatalf("expected %#v (%T), got %#v (%T)", tc.expected, tc.expected, got, got)
 			}
+		})
+	}
+}
+
+func TestMySQLGetStreamNames(t *testing.T) {
+	testCases := []struct {
+		name   string
+		tables []string
+		want   []string
+	}{
+		{
+			name: "lists the tables of the configured database",
+			tables: []string{
+				`CREATE TABLE users (id int PRIMARY KEY)`,
+				`CREATE TABLE orders (id int PRIMARY KEY)`,
+			},
+			want: []string{"users", "orders"},
+		},
+		{
+			name: "a database without tables has no streams",
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			database := testhandler.New(t).MySQL()
+			m := &MySQL{config: &Config{
+				Host:     database.Host,
+				Port:     database.Port,
+				Database: database.Database,
+				Username: database.Username,
+				Password: database.Password,
+			}}
+			require.NoError(t, m.Setup(t.Context()))
+			t.Cleanup(func() { _ = m.Close() })
+			for _, table := range tc.tables {
+				_, err := m.client.ExecContext(t.Context(), table)
+				require.NoError(t, err)
+			}
+
+			got, err := m.GetStreamNames(t.Context())
+			require.NoError(t, err)
+			want := make([]types.StreamID, 0, len(tc.want))
+			for _, name := range tc.want {
+				want = append(want, types.StreamID{Namespace: database.Database, Name: name})
+			}
+			require.ElementsMatch(t, want, got)
 		})
 	}
 }
