@@ -33,6 +33,7 @@ type ArrowWriter struct {
 	writers        map[string]*Writer
 	createdFiles   map[string]*PartitionFiles
 	upsertMode     bool
+	hasPK          bool
 	indexThread    *types.StreamIndexThread
 	// deleteMode decides how superseded rows are expressed: under DeletionVector, positions stream to the server as Puffin vectors instead of a delete file.
 	deleteMode types.UpdateType
@@ -80,6 +81,11 @@ type PositionalDelete struct {
 }
 
 func New(ctx context.Context, options *destination.Options, partitionInfo []internal.PartitionInfo, schema map[string]string, stream types.StreamInterface, server internal.ServerClient, upsertMode bool, indexThread *types.StreamIndexThread) (*ArrowWriter, error) {
+	hasPK := false
+	if stream != nil && stream.GetStream() != nil && stream.GetStream().SourceDefinedPrimaryKey != nil {
+		hasPK = stream.GetStream().SourceDefinedPrimaryKey.Len() > 0
+	}
+
 	writer := &ArrowWriter{
 		options:       options,
 		partitionInfo: partitionInfo,
@@ -90,6 +96,7 @@ func New(ctx context.Context, options *destination.Options, partitionInfo []inte
 		writers:       make(map[string]*Writer),
 		createdFiles:  make(map[string]*PartitionFiles),
 		upsertMode:    upsertMode,
+		hasPK:         hasPK,
 		indexThread:   indexThread,
 		deleteMode:    stream.GetUpdateType(),
 
@@ -233,7 +240,12 @@ func (w *ArrowWriter) extract(ctx context.Context, records []types.RawRecord) er
 
 // search for index for the record and emmit pos when found
 func (w *ArrowWriter) indexRecord(writer *Writer, olakeID string, opType string, olakeColumns map[string]any, filePosition int64) error {
-	if w.upsertMode && opType != "r" && opType != "c" {
+	// CDC re-inserts of a deleted primary key arrive as opType="c". If the stream
+	// defines a primary key, look up the index to emit a positional delete for the
+	// soft-deleted tombstone (or an earlier version of the row). Streams without a
+	// primary key skip this lookup to preserve duplicate-insert semantics. Append-mode
+	// streams do not use the index (upsertMode is false), so they are unaffected.
+	if w.upsertMode && opType != "r" && (opType != "c" || w.hasPK) {
 		previous, found, err := w.indexThread.Lookup(olakeID)
 		if err != nil {
 			return fmt.Errorf("failed to look up row[%s] in index: %s", olakeID, err)

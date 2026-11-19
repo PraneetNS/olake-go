@@ -22,9 +22,15 @@ type LegacyWriter struct {
 	server      internal.ServerClient
 	indexThread *types.StreamIndexThread
 	upsertMode  bool
+	hasPK       bool
 }
 
 func New(options *destination.Options, schema map[string]string, stream types.StreamInterface, server internal.ServerClient, upsertMode bool, indexThread *types.StreamIndexThread) *LegacyWriter {
+	hasPK := false
+	if stream != nil && stream.GetStream() != nil && stream.GetStream().SourceDefinedPrimaryKey != nil {
+		hasPK = stream.GetStream().SourceDefinedPrimaryKey.Len() > 0
+	}
+
 	return &LegacyWriter{
 		options:     options,
 		schema:      schema,
@@ -32,6 +38,7 @@ func New(options *destination.Options, schema map[string]string, stream types.St
 		server:      server,
 		upsertMode:  upsertMode,
 		indexThread: indexThread,
+		hasPK:       hasPK,
 	}
 }
 
@@ -61,9 +68,10 @@ func (w *LegacyWriter) Write(ctx context.Context, records []types.RawRecord) err
 		var deleteFilePath *string
 		var deletePosition *int64
 
-		// check if we need to write pos for the current record
-		// lookup u/i/d only. skip r and c
-		if w.indexThread != nil && opType != "r" && opType != "c" {
+		// check if we need to write pos for the current record.
+		// lookup u/i/d, and c when the stream has a primary key (to delete previous tombstone or row).
+		// skip r and PK-less c. Append-mode streams do not use the index, so they are unaffected.
+		if w.indexThread != nil && opType != "r" && (opType != "c" || w.hasPK) {
 			previous, found, err := w.indexThread.Lookup(olakeID)
 			if err != nil {
 				return fmt.Errorf("failed to look up row[%s] in index: %s", olakeID, err)

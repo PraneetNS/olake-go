@@ -1,11 +1,13 @@
 package legacywriter
 
 import (
+	"context"
 	"fmt"
 	"testing"
 	"time"
 
 	"github.com/datazip-inc/olake/constants"
+	"github.com/datazip-inc/olake/destination"
 	"github.com/datazip-inc/olake/destination/iceberg/proto"
 	"github.com/datazip-inc/olake/types"
 	"github.com/datazip-inc/olake/utils/typeutils"
@@ -205,4 +207,134 @@ func TestRawDataColumnBuffer(t *testing.T) {
 		values[1].GetValue(),
 		"the denormalized column is json, so raw bytes travel base64 encoded and stay valid utf-8")
 	assert.Nil(t, values[2], "a schema field the record does not carry is sent unset")
+}
+
+type committedIndex struct{ types.StreamIndex }
+
+func (committedIndex) Lookup(_ string) (types.RowLocation, bool, error) {
+	return types.RowLocation{}, false, nil
+}
+func (committedIndex) LastCommittedSnapshot() (int64, error)         { return 0, nil }
+func (committedIndex) Commit(*types.StreamIndexThread, *int64) error { return nil }
+
+type mockServer struct {
+	sentPayloads []*proto.IcebergPayload
+	currentFile  string
+	nextPosition int64
+}
+
+func (m *mockServer) SendClientRequest(_ context.Context, reqPayload interface{}) (interface{}, error) {
+	req := reqPayload.(*proto.IcebergPayload)
+	m.sentPayloads = append(m.sentPayloads, req)
+
+	ranges := make([]*proto.FilePositionMap_Range, 0, len(req.Records))
+	for i := range req.Records {
+		ranges = append(ranges, &proto.FilePositionMap_Range{
+			BatchStartIdx: int32(i), //nolint:gosec // test index fits within int32
+			StartPosition: m.nextPosition,
+			Count:         1,
+		})
+		m.nextPosition++
+	}
+
+	return &proto.RecordIngestResponse{
+		Result: "ok",
+		FilePositionMaps: []*proto.FilePositionMap{
+			{
+				FilePath: m.currentFile,
+				Ranges:   ranges,
+			},
+		},
+	}, nil
+}
+
+func newTestLegacyWriter(t *testing.T, hasPK bool) (*LegacyWriter, *mockServer, *types.StreamIndexThread) {
+	t.Helper()
+	server := &mockServer{currentFile: "test_data.parquet"}
+	index := types.NewStreamIndexThread(committedIndex{})
+	pkSet := types.NewSet[string]()
+	if hasPK {
+		pkSet.Insert("id")
+	}
+	stream := &types.ConfiguredStream{
+		Stream: &types.Stream{
+			Name:                    "t",
+			Namespace:               "n",
+			SourceDefinedPrimaryKey: pkSet,
+		},
+	}
+	schema := map[string]string{
+		constants.OlakeID: "string",
+		constants.OpType:  "string",
+		"payload":         "string",
+	}
+	w := New(&destination.Options{ThreadID: "th"}, schema, stream, server, true, index)
+	return w, server, index
+}
+
+func testLegacyRecord(id, op, payload string) types.RawRecord {
+	return types.RawRecord{
+		Data: map[string]any{
+			constants.OlakeID: id,
+			constants.OpType:  op,
+			"payload":         payload,
+		},
+		OlakeColumns: map[string]any{
+			constants.OlakeID:        id,
+			constants.OpType:         op,
+			constants.OlakeTimestamp: time.Now().UTC(),
+		},
+	}
+}
+
+// TestLegacyWriterReinsertDeletedPrimaryKeyWithPK verifies issue #1286 in legacy-writer:
+// When a PK stream deletes a row and re-inserts it ('c'), the legacy writer emits a positional
+// delete (DeleteFilePath and DeletePosition set) pointing to the tombstone row.
+func TestLegacyWriterReinsertDeletedPrimaryKeyWithPK(t *testing.T) {
+	ctx := context.Background()
+	w, server, _ := newTestLegacyWriter(t, true)
+
+	// 1. Insert key "1"
+	require.NoError(t, w.Write(ctx, []types.RawRecord{testLegacyRecord("1", "c", "v1")}))
+	require.Len(t, server.sentPayloads, 1)
+	req1 := server.sentPayloads[0]
+	require.Len(t, req1.Records, 1)
+	assert.Nil(t, req1.Records[0].DeleteFilePath, "initial insert should not have delete file path")
+
+	// 2. Delete key "1" (writes tombstone at pos 1, deletes pos 0)
+	require.NoError(t, w.Write(ctx, []types.RawRecord{testLegacyRecord("1", "d", "v1")}))
+	require.Len(t, server.sentPayloads, 2)
+	req2 := server.sentPayloads[1]
+	require.Len(t, req2.Records, 1)
+	require.NotNil(t, req2.Records[0].DeleteFilePath)
+	assert.Equal(t, "test_data.parquet", *req2.Records[0].DeleteFilePath)
+	require.NotNil(t, req2.Records[0].DeletePosition)
+	assert.Equal(t, int64(0), *req2.Records[0].DeletePosition)
+
+	// 3. Re-insert key "1" ('c')
+	// On staging before fix: DeleteFilePath was nil (skipped lookup for 'c').
+	// With fix: DeleteFilePath and DeletePosition point to tombstone at pos 1!
+	require.NoError(t, w.Write(ctx, []types.RawRecord{testLegacyRecord("1", "c", "v2")}))
+	require.Len(t, server.sentPayloads, 3)
+	req3 := server.sentPayloads[2]
+	require.Len(t, req3.Records, 1)
+	require.NotNil(t, req3.Records[0].DeleteFilePath, "re-insert of deleted PK must emit positional delete for the tombstone")
+	assert.Equal(t, "test_data.parquet", *req3.Records[0].DeleteFilePath)
+	require.NotNil(t, req3.Records[0].DeletePosition)
+	assert.Equal(t, int64(1), *req3.Records[0].DeletePosition)
+}
+
+// TestLegacyWriterPKLessStreamPreservesDuplicateInserts verifies that tables without a primary key
+// do not look up index for 'c' records, emitting no positional deletes.
+func TestLegacyWriterPKLessStreamPreservesDuplicateInserts(t *testing.T) {
+	ctx := context.Background()
+	w, server, _ := newTestLegacyWriter(t, false)
+
+	// Insert duplicate records
+	require.NoError(t, w.Write(ctx, []types.RawRecord{testLegacyRecord("hash1", "c", "dup")}))
+	require.NoError(t, w.Write(ctx, []types.RawRecord{testLegacyRecord("hash1", "c", "dup")}))
+
+	require.Len(t, server.sentPayloads, 2)
+	assert.Nil(t, server.sentPayloads[0].Records[0].DeleteFilePath)
+	assert.Nil(t, server.sentPayloads[1].Records[0].DeleteFilePath, "PK-less duplicate insert should not emit positional delete")
 }

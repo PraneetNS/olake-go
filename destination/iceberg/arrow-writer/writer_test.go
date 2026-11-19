@@ -40,8 +40,9 @@ func (committedIndex) Commit(*types.StreamIndexThread, *int64) error { return ni
 
 // uploadServer stands in for the Java server: it hands out file paths and keeps the files uploaded.
 type uploadServer struct {
-	paths    int
-	uploaded map[string][]byte
+	paths           int
+	uploaded        map[string][]byte
+	deletionVectors []*proto.ArrowPayload_DeletionVectorBatch
 }
 
 func (s *uploadServer) SendClientRequest(_ context.Context, req any) (any, error) {
@@ -62,6 +63,9 @@ func (s *uploadServer) SendClientRequest(_ context.Context, req any) (any, error
 		return &proto.ArrowIngestResponse{}, nil
 	case proto.ArrowPayload_REGISTER_AND_COMMIT:
 		return &proto.ArrowIngestResponse{}, nil
+	case proto.ArrowPayload_DELETION_VECTORS:
+		s.deletionVectors = append(s.deletionVectors, payload.GetMetadata().GetDeletionVectors())
+		return &proto.ArrowIngestResponse{}, nil
 	}
 	return nil, fmt.Errorf("unexpected %v", payload.GetType())
 }
@@ -72,7 +76,14 @@ func newTestWriter(t *testing.T, partitionInfo []internal.PartitionInfo) (*Arrow
 
 	server := &uploadServer{uploaded: map[string][]byte{}}
 	updateType := "pos"
-	stream := &types.ConfiguredStream{Stream: &types.Stream{Name: "t", Namespace: "n"}, StreamMetadata: types.StreamMetadata{UpdateType: &updateType}}
+	stream := &types.ConfiguredStream{
+		Stream: &types.Stream{
+			Name:                    "t",
+			Namespace:               "n",
+			SourceDefinedPrimaryKey: types.NewSet("id"),
+		},
+		StreamMetadata: types.StreamMetadata{UpdateType: &updateType},
+	}
 	index := types.NewStreamIndexThread(committedIndex{})
 	schema := map[string]string{"_olake_id": "string", "_op_type": "string", "_olake_timestamp": "timestamptz", "payload": "string"}
 	w, err := New(context.Background(), &destination.Options{ThreadID: "th", TableIndex: committedIndex{}}, partitionInfo, schema, stream, server, true, index)
@@ -254,4 +265,281 @@ func TestEnsureReadableUploadsNamedOpenFiles(t *testing.T) {
 			assert.ElementsMatch(t, filesOf(tc.wantUploaded), slices.Collect(maps.Keys(server.uploaded)))
 		})
 	}
+}
+
+func collectLiveRowsFromWriters(t *testing.T, server *uploadServer, writers ...*ArrowWriter) [][]string {
+	t.Helper()
+
+	var dataFiles, deleteFiles []string
+	for _, w := range writers {
+		for _, files := range w.createdFiles {
+			for _, data := range files.DataFiles {
+				dataFiles = append(dataFiles, data.FilePath)
+			}
+			for _, deletes := range files.PosDeleteFiles {
+				deleteFiles = append(deleteFiles, deletes.FilePath)
+			}
+		}
+	}
+
+	stored := map[types.RowLocation][]string{}
+	for _, path := range dataFiles {
+		for position, row := range parquetRows(t, server.uploaded[path], constants.OlakeID, constants.OpType, "payload") {
+			stored[types.RowLocation{FilePath: path, Position: int64(position)}] = row
+		}
+	}
+
+	var deletedLocations []types.RowLocation
+	for _, path := range deleteFiles {
+		for _, row := range parquetRows(t, server.uploaded[path], "file_path", "pos") {
+			position, err := strconv.ParseInt(row[1], 10, 64)
+			require.NoError(t, err)
+			deletedLocations = append(deletedLocations, types.RowLocation{FilePath: row[0], Position: position})
+		}
+	}
+
+	var liveRows [][]string
+	for loc, row := range stored {
+		if !slices.Contains(deletedLocations, loc) {
+			liveRows = append(liveRows, row)
+		}
+	}
+	return liveRows
+}
+
+func collectLiveRows(t *testing.T, w *ArrowWriter, server *uploadServer) [][]string {
+	t.Helper()
+	return collectLiveRowsFromWriters(t, server, w)
+}
+
+// TestReinsertDeletedPrimaryKeyLeavesNoTombstoneLive reproduces and verifies the fix for issue #1286:
+// When a primary key is deleted, a tombstone row (_op_type = 'd') is written and indexed.
+// When that same primary key is re-inserted ('c'), the writer must emit a positional delete
+// against the tombstone row so only the re-inserted row remains live.
+func TestReinsertDeletedPrimaryKeyLeavesNoTombstoneLive(t *testing.T) {
+	t.Run("successive batches", func(t *testing.T) {
+		ctx := context.Background()
+		w, server, _ := newTestWriter(t, nil)
+
+		// 1. Insert key "1"
+		require.NoError(t, w.Write(ctx, []types.RawRecord{testRecord("1", "c", "v1")}))
+		// 2. Delete key "1" (writes tombstone at pos 1, deletes pos 0)
+		require.NoError(t, w.Write(ctx, []types.RawRecord{testRecord("1", "d", "v1")}))
+		// 3. Re-insert key "1" (should delete tombstone at pos 1, write new row at pos 2)
+		require.NoError(t, w.Write(ctx, []types.RawRecord{testRecord("1", "c", "v2")}))
+
+		require.NoError(t, w.Close(ctx, nil))
+
+		liveRows := collectLiveRows(t, w, server)
+		assert.Len(t, liveRows, 1, "expected exactly 1 live row after re-insert, but found soft-deleted tombstone still live")
+		if len(liveRows) == 1 {
+			assert.Equal(t, []string{"1", "c", "v2"}, liveRows[0])
+		}
+	})
+
+	t.Run("same batch", func(t *testing.T) {
+		ctx := context.Background()
+		w, server, _ := newTestWriter(t, nil)
+
+		// c -> d -> c all within a single Write batch
+		require.NoError(t, w.Write(ctx, []types.RawRecord{
+			testRecord("1", "c", "v1"),
+			testRecord("1", "d", "v1"),
+			testRecord("1", "c", "v2"),
+		}))
+
+		require.NoError(t, w.Close(ctx, nil))
+
+		liveRows := collectLiveRows(t, w, server)
+		assert.Len(t, liveRows, 1, "expected exactly 1 live row after re-insert in single batch")
+		if len(liveRows) == 1 {
+			assert.Equal(t, []string{"1", "c", "v2"}, liveRows[0])
+		}
+	})
+}
+
+// TestReinsertDeletedPrimaryKeyAcrossWriters verifies that when a delete occurs in one sync cycle / writer
+// and re-insert occurs in a subsequent writer sharing the index, the tombstone in the earlier file is deleted.
+func TestReinsertDeletedPrimaryKeyAcrossWriters(t *testing.T) {
+	ctx := context.Background()
+	server := &uploadServer{uploaded: map[string][]byte{}}
+	updateType := "pos"
+	stream := &types.ConfiguredStream{
+		Stream: &types.Stream{
+			Name:                    "t",
+			Namespace:               "n",
+			SourceDefinedPrimaryKey: types.NewSet("id"),
+		},
+		StreamMetadata: types.StreamMetadata{UpdateType: &updateType},
+	}
+	index := types.NewStreamIndexThread(committedIndex{})
+	schema := map[string]string{"_olake_id": "string", "_op_type": "string", "_olake_timestamp": "timestamptz", "payload": "string"}
+
+	// Writer 1: inserts then deletes key "1", then closes
+	w1, err := New(ctx, &destination.Options{ThreadID: "th1", TableIndex: committedIndex{}}, nil, schema, stream, server, true, index)
+	require.NoError(t, err)
+	require.NoError(t, w1.Write(ctx, []types.RawRecord{testRecord("1", "c", "v1")}))
+	require.NoError(t, w1.Write(ctx, []types.RawRecord{testRecord("1", "d", "v1")}))
+	require.NoError(t, w1.Close(ctx, nil))
+
+	// Writer 2: re-inserts key "1" in a new sync cycle using the shared index thread
+	w2, err := New(ctx, &destination.Options{ThreadID: "th2", TableIndex: committedIndex{}}, nil, schema, stream, server, true, index)
+	require.NoError(t, err)
+	require.NoError(t, w2.Write(ctx, []types.RawRecord{testRecord("1", "c", "v2")}))
+	require.NoError(t, w2.Close(ctx, nil))
+
+	liveRows := collectLiveRowsFromWriters(t, server, w1, w2)
+	assert.Len(t, liveRows, 1, "expected exactly 1 live row across writer cycles")
+	if len(liveRows) == 1 {
+		assert.Equal(t, []string{"1", "c", "v2"}, liveRows[0])
+	}
+}
+
+// TestMultipleReinsertsOfDeletedPrimaryKey verifies c -> d -> c -> c leaves only the latest row live.
+func TestMultipleReinsertsOfDeletedPrimaryKey(t *testing.T) {
+	ctx := context.Background()
+	w, server, _ := newTestWriter(t, nil)
+
+	require.NoError(t, w.Write(ctx, []types.RawRecord{testRecord("1", "c", "v1")}))
+	require.NoError(t, w.Write(ctx, []types.RawRecord{testRecord("1", "d", "v1")}))
+	require.NoError(t, w.Write(ctx, []types.RawRecord{testRecord("1", "c", "v2")}))
+	require.NoError(t, w.Write(ctx, []types.RawRecord{testRecord("1", "c", "v3")}))
+	require.NoError(t, w.Close(ctx, nil))
+
+	liveRows := collectLiveRows(t, w, server)
+	assert.Len(t, liveRows, 1, "expected exactly 1 live row after multiple re-inserts")
+	if len(liveRows) == 1 {
+		assert.Equal(t, []string{"1", "c", "v3"}, liveRows[0])
+	}
+}
+
+// TestPKLessStreamPreservesDuplicateInserts verifies that tables without a primary key do not
+// emit positional deletes for 'c' records, preserving SQL multiset (duplicate insert) semantics.
+func TestPKLessStreamPreservesDuplicateInserts(t *testing.T) {
+	ctx := context.Background()
+	server := &uploadServer{uploaded: map[string][]byte{}}
+	updateType := "pos"
+	// Stream without primary key
+	stream := &types.ConfiguredStream{
+		Stream: &types.Stream{
+			Name:                    "t",
+			Namespace:               "n",
+			SourceDefinedPrimaryKey: types.NewSet[string](),
+		},
+		StreamMetadata: types.StreamMetadata{UpdateType: &updateType},
+	}
+	index := types.NewStreamIndexThread(committedIndex{})
+	schema := map[string]string{"_olake_id": "string", "_op_type": "string", "_olake_timestamp": "timestamptz", "payload": "string"}
+	w, err := New(ctx, &destination.Options{ThreadID: "th", TableIndex: committedIndex{}}, nil, schema, stream, server, true, index)
+	require.NoError(t, err)
+
+	// Three identical inserts
+	require.NoError(t, w.Write(ctx, []types.RawRecord{
+		testRecord("hash1", "c", "dup"),
+		testRecord("hash1", "c", "dup"),
+		testRecord("hash1", "c", "dup"),
+	}))
+	require.NoError(t, w.Close(ctx, nil))
+
+	liveRows := collectLiveRows(t, w, server)
+	// All 3 duplicate inserts must remain live (no deletes emitted)
+	assert.Len(t, liveRows, 3, "PK-less stream must preserve duplicate inserts as separate live rows")
+	for _, files := range w.createdFiles {
+		assert.Empty(t, files.PosDeleteFiles, "PK-less stream should not emit positional delete files for 'c' records")
+	}
+}
+
+// TestReplayedInsertOnLiveKeyDeduplicates verifies that if a 'c' record is replayed against an
+// existing live key without an intervening delete (e.g. CDC replay), the prior row is deleted.
+func TestReplayedInsertOnLiveKeyDeduplicates(t *testing.T) {
+	ctx := context.Background()
+	w, server, _ := newTestWriter(t, nil)
+
+	// 1. Initial insert
+	require.NoError(t, w.Write(ctx, []types.RawRecord{testRecord("1", "c", "v1")}))
+	// 2. Replayed insert of the same key without a delete
+	require.NoError(t, w.Write(ctx, []types.RawRecord{testRecord("1", "c", "v2")}))
+	require.NoError(t, w.Close(ctx, nil))
+
+	liveRows := collectLiveRows(t, w, server)
+	assert.Len(t, liveRows, 1, "replayed insert on live key must supersede prior row")
+	if len(liveRows) == 1 {
+		assert.Equal(t, []string{"1", "c", "v2"}, liveRows[0])
+	}
+}
+
+// TestEqualityDeleteModeUnchanged verifies that equality delete mode (when indexThread is nil)
+// behaves unchanged and produces equality delete files.
+func TestEqualityDeleteModeUnchanged(t *testing.T) {
+	ctx := context.Background()
+	server := &uploadServer{uploaded: map[string][]byte{}}
+	updateType := "pos"
+	stream := &types.ConfiguredStream{
+		Stream: &types.Stream{
+			Name:                    "t",
+			Namespace:               "n",
+			SourceDefinedPrimaryKey: types.NewSet("id"),
+		},
+		StreamMetadata: types.StreamMetadata{UpdateType: &updateType},
+	}
+	schema := map[string]string{"_olake_id": "string", "_op_type": "string", "_olake_timestamp": "timestamptz", "payload": "string"}
+	// indexThread == nil triggers equality delete path
+	w, err := New(ctx, &destination.Options{ThreadID: "th", TableIndex: committedIndex{}}, nil, schema, stream, server, true, nil)
+	require.NoError(t, err)
+
+	require.NoError(t, w.Write(ctx, []types.RawRecord{
+		testRecord("1", "c", "v1"),
+		testRecord("1", "d", "v1"),
+		testRecord("1", "c", "v2"),
+	}))
+	require.NoError(t, w.Close(ctx, nil))
+
+	var eqDeleteFiles []string
+	for _, files := range w.createdFiles {
+		for _, eq := range files.EqDeleteFiles {
+			eqDeleteFiles = append(eqDeleteFiles, eq.FilePath)
+		}
+	}
+	assert.NotEmpty(t, eqDeleteFiles, "equality delete mode should produce equality delete files")
+}
+
+// TestDeletionVectorModeReinsertDeletedPrimaryKey verifies that in deletion vector mode ("dv"),
+// re-inserting a deleted primary key queues and sends a deletion vector for the tombstone position.
+func TestDeletionVectorModeReinsertDeletedPrimaryKey(t *testing.T) {
+	ctx := context.Background()
+	server := &uploadServer{uploaded: map[string][]byte{}}
+	updateType := string(types.UpdateTypeDeletionVector)
+	stream := &types.ConfiguredStream{
+		Stream: &types.Stream{
+			Name:                    "t",
+			Namespace:               "n",
+			SourceDefinedPrimaryKey: types.NewSet("id"),
+		},
+		StreamMetadata: types.StreamMetadata{UpdateType: &updateType},
+	}
+	index := types.NewStreamIndexThread(committedIndex{})
+	schema := map[string]string{"_olake_id": "string", "_op_type": "string", "_olake_timestamp": "timestamptz", "payload": "string"}
+	w, err := New(ctx, &destination.Options{ThreadID: "th", TableIndex: committedIndex{}}, nil, schema, stream, server, true, index)
+	require.NoError(t, err)
+
+	// 1. Insert key "1" (pos 0)
+	require.NoError(t, w.Write(ctx, []types.RawRecord{testRecord("1", "c", "v1")}))
+	// 2. Delete key "1" (pos 1, queues DV for pos 0)
+	require.NoError(t, w.Write(ctx, []types.RawRecord{testRecord("1", "d", "v1")}))
+	// 3. Re-insert key "1" (pos 2, queues DV for pos 1)
+	require.NoError(t, w.Write(ctx, []types.RawRecord{testRecord("1", "c", "v2")}))
+
+	require.NoError(t, w.Close(ctx, nil))
+
+	// Verify deletion vectors sent to server
+	require.NotEmpty(t, server.deletionVectors, "deletion vectors must be sent to server in dv mode")
+	var deletedPositions []int64
+	for _, batch := range server.deletionVectors {
+		for _, entry := range batch.GetEntries() {
+			deletedPositions = append(deletedPositions, entry.GetPositions()...)
+		}
+	}
+	// Positions 0 (original insert) and 1 (tombstone) must both be deleted!
+	assert.Contains(t, deletedPositions, int64(0), "original insert position 0 must be deleted")
+	assert.Contains(t, deletedPositions, int64(1), "tombstone position 1 must be deleted by the re-insert")
 }
