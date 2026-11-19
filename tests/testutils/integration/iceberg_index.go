@@ -376,3 +376,87 @@ func (th *TestHandler) testIcebergPosIncrementalInsert(ctx context.Context, t *t
 
 	return nil
 }
+
+// ReinsertedText is the col_text payload the "reinsert_deleted" operation gives the primary key it brings back.
+const ReinsertedText = "reinserted after delete"
+
+// TestIcebergReinsertDeletedPK syncs a primary key through CDC as deleted and then as inserted again, into a pos-mode
+// stream that keeps a table index. The re-insert must supersede the delete's tombstone, not sit beside it.
+func (th *TestHandler) TestIcebergReinsertDeletedPK(t *testing.T) {
+	ctx := t.Context()
+	testTable := th.GetTableName()
+
+	writerTypes := []struct {
+		name     string
+		useArrow bool
+	}{
+		{"Legacy", false},
+		{"Arrow", true},
+	}
+	for _, wt := range writerTypes {
+		t.Run(wt.name, func(t *testing.T) {
+			require.NoError(t, th.IcebergWriter(ctx, t, testTable, wt.useArrow, th.testIcebergReinsertDeletedPK))
+		})
+	}
+
+	if testutils.KeepTestData() {
+		t.Logf("keeping %s source data for ReinsertDeletedPK as (%s) is set", th.Driver, testutils.KeepTestDataEnvVar)
+		return
+	}
+	th.ExecuteQuery(ctx, t, th.TestConfig, "drop")
+}
+
+// testIcebergReinsertDeletedPK full-loads the seed rows in pos mode, then deletes row 1 and inserts it back, each in
+// its own CDC sync so the second sync finds the tombstone only through the table index.
+func (th *TestHandler) testIcebergReinsertDeletedPK(ctx context.Context, t *testing.T, testTable string) error {
+	if err := th.prepareTableIndexSync(ctx, t, testTable); err != nil {
+		return err
+	}
+	defer testutils.DropIcebergTable(t, testTable, th.TestConfig.DestinationDB)
+
+	fullTableName := fmt.Sprintf("%s.%s.%s", testutils.IcebergCatalog, th.TestConfig.DestinationDB, testTable)
+	if err := setUpdateType(th.TestConfig, th.Namespace, testTable, "pos"); err != nil {
+		return fmt.Errorf("failed setting delete type: %w", err)
+	}
+	// The filter would drop the delete: its record carries only the key, none of the filtered columns.
+	if err := editSelectedStream(th.TestConfig, th.Namespace, testTable, func(entry map[string]interface{}) {
+		entry["filter_config"] = map[string]interface{}{}
+	}); err != nil {
+		return fmt.Errorf("failed clearing the filter: %w", err)
+	}
+
+	if err := th.runIcebergSync(ctx, t, "initial full load", false); err != nil {
+		return err
+	}
+	spark := getSparkSession(ctx, t)
+	liveRows := countLiveRecords(ctx, t, spark, fullTableName)
+
+	th.TestConfig.ExecuteQuery(ctx, t, th.TestConfig, "delete")
+	if err := th.runIcebergSync(ctx, t, "cdc delete sync", true); err != nil {
+		return err
+	}
+	// The delete swaps row 1 for its tombstone; without one live here the re-insert below proves nothing.
+	require.Equal(t, int64(1), countByOpType(ctx, t, spark, fullTableName, "d"), "the delete must leave one live tombstone")
+	require.Equal(t, liveRows, countLiveRecords(ctx, t, spark, fullTableName), "live rows after the delete")
+
+	th.TestConfig.ExecuteQuery(ctx, t, th.TestConfig, "reinsert_deleted")
+	if err := th.runIcebergSync(ctx, t, "cdc re-insert sync", true); err != nil {
+		return err
+	}
+
+	refreshTable(ctx, t, spark, fullTableName)
+	if df, err := spark.Sql(ctx, fmt.Sprintf("SELECT col_bigserial, col_text, _op_type FROM %s WHERE col_bigserial = 1", fullTableName)); err == nil {
+		if rows, err := df.Collect(ctx); err == nil {
+			for i, r := range rows {
+				t.Logf("  [spark query PK=1] row %d: id=%v, col_text=%q, _op_type=%v", i+1, r.Value("col_bigserial"), r.Value("col_text"), r.Value("_op_type"))
+			}
+		}
+	}
+	key := fmt.Sprintf("SELECT count(*) as cnt FROM %s WHERE col_bigserial = 1", fullTableName)
+	require.Equal(t, int64(1), countSpark(ctx, t, spark, key), "row 1 must have exactly one live row after the re-insert")
+	require.Equal(t, int64(1), countSpark(ctx, t, spark, fmt.Sprintf("%s AND _op_type = 'c' AND col_text = '%s'", key, ReinsertedText)), "the live row 1 must be the re-inserted one")
+	require.Equal(t, int64(0), countByOpType(ctx, t, spark, fullTableName, "d"), "the re-insert must supersede the tombstone")
+	require.Equal(t, liveRows, countLiveRecords(ctx, t, spark, fullTableName), "live rows after the re-insert")
+
+	return nil
+}

@@ -258,6 +258,12 @@ func ExecuteQuery(ctx context.Context, t *testing.T, conf *testutils.TestConfig,
 	case "delete":
 		query = fmt.Sprintf("DELETE FROM %s WHERE col_bigserial = 1", integrationTestTable)
 
+	case "reinsert_deleted":
+		// the primary key "delete" removed, back with a new payload
+		query = fmt.Sprintf(`
+			INSERT INTO %s (col_bigserial, col_cursor, col_double_precision, col_timestamp, col_text)
+			VALUES (1, 1, 123.456789, '2023-01-01 12:00:00.573605', '%s')`, integrationTestTable, integration.ReinsertedText)
+
 	case "reset_cdc_config":
 		dropQuery := fmt.Sprintf(`SELECT pg_drop_replication_slot('%s')
 						WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = '%s');`, replicationSlot, replicationSlot)
